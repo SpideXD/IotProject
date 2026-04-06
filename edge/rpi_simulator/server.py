@@ -13,6 +13,7 @@ Usage:
 import argparse
 import base64
 import io
+import json
 import logging
 import os
 import sys
@@ -29,6 +30,13 @@ from rpi_simulator.config import (
     CLASS_NAMES,
     CONF_THRESHOLD,
 )
+
+# MQTT Configuration for RPi → Edge communication
+MQTT_BROKER_HOST = os.environ.get("MQTT_HOST", "localhost")
+MQTT_BROKER_PORT = int(os.environ.get("MQTT_PORT", 1883))
+MQTT_CLIENT_ID = f"liberty_twin_rpi_{os.getpid()}"
+MQTT_KEEPALIVE = 60
+MQTT_TOPIC_RPI_OCCUPANCY = "liberty_twin/sensor/{zone}/occupancy"  # RPi publishes here
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,6 +59,122 @@ try:
 except ImportError:
     ULTRALYTICS_AVAILABLE = False
     logger.warning("ultralytics not installed. YOLO inference disabled.")
+
+
+# =============================================================================
+# MQTT Client for RPi → Edge Communication
+# =============================================================================
+
+mqtt_client = None
+_mqtt_reconnect_delay = 1.0
+_mqtt_max_reconnect_delay = 30.0
+
+
+def _should_reconnect_mqtt() -> bool:
+    global mqtt_client
+    if mqtt_client is None:
+        return True
+    if not hasattr(mqtt_client, 'is_connected'):
+        return True
+    return not mqtt_client.is_connected()
+
+
+def _attempt_mqtt_reconnect():
+    global _mqtt_reconnect_delay
+    if not _should_reconnect_mqtt():
+        return
+    try:
+        if mqtt_client:
+            mqtt_client.reconnect()
+            _mqtt_reconnect_delay = 1.0  # Reset on success
+    except Exception as exc:
+        logger.warning("MQTT reconnect failed: %s", exc)
+        _mqtt_reconnect_delay = min(_mqtt_reconnect_delay * 2, _mqtt_max_reconnect_delay)
+
+
+def _mqtt_reconnect_worker():
+    global _mqtt_reconnect_delay
+    while True:
+        time.sleep(_mqtt_reconnect_delay)
+        if _should_reconnect_mqtt():
+            _attempt_mqtt_reconnect()
+
+
+_mqtt_reconnect_thread = None
+
+
+def _start_mqtt_reconnect_worker():
+    global _mqtt_reconnect_thread
+    _mqtt_reconnect_thread = threading.Thread(target=_mqtt_reconnect_worker, daemon=True)
+    _mqtt_reconnect_thread.start()
+
+
+def _on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
+    if reason_code.is_failure:
+        logger.warning("MQTT connection refused: %s", reason_code)
+    else:
+        global _mqtt_reconnect_delay
+        _mqtt_reconnect_delay = 1.0  # Reset backoff on successful connection
+        logger.info("MQTT connected to %s:%s", MQTT_BROKER_HOST, MQTT_BROKER_PORT)
+
+
+def _on_mqtt_disconnect(client, userdata, flags, reason_code=None, properties=None):
+    global _mqtt_reconnect_delay
+    _mqtt_reconnect_delay = 1.0  # Reset on disconnect
+    logger.warning("MQTT disconnected (rc=%s). Will retry with backoff.", reason_code)
+
+
+def _init_mqtt() -> bool:
+    global mqtt_client
+    try:
+        import paho.mqtt.client as paho_mqtt
+        try:
+            # Version 2.x API
+            client = paho_mqtt.Client(
+                callback_api_version=paho_mqtt.CallbackAPIVersion.VERSION2,
+                client_id=MQTT_CLIENT_ID,
+            )
+        except (AttributeError, TypeError):
+            # Fallback to version 1.x API
+            client = paho_mqtt.Client(client_id=MQTT_CLIENT_ID)
+
+        client.on_connect = _on_mqtt_connect
+        client.on_disconnect = _on_mqtt_disconnect
+
+        client.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT, MQTT_KEEPALIVE)
+        client.loop_start()
+        mqtt_client = client
+        _start_mqtt_reconnect_worker()  # Start background reconnection worker
+        return True
+    except ImportError:
+        logger.warning("paho-mqtt not installed. MQTT disabled.")
+        return False
+    except Exception as exc:
+        logger.warning("Cannot connect to MQTT broker at %s:%s (%s). MQTT disabled.",
+                       MQTT_BROKER_HOST, MQTT_BROKER_PORT, exc)
+        return False
+
+
+def _publish_to_edge_via_mqtt(data: dict, zone: str) -> bool:
+    """Publish occupancy data to Edge via MQTT."""
+    global mqtt_client
+    topic = MQTT_TOPIC_RPI_OCCUPANCY.format(zone=zone)
+    try:
+        if mqtt_client is not None and mqtt_client.is_connected():
+            payload = json.dumps(data)
+            result = mqtt_client.publish(topic, payload, qos=1)
+            if result.is_published:
+                logger.debug("Published occupancy to %s", topic)
+                return True
+            else:
+                logger.warning("MQTT publish to %s returned %s", topic, result)
+                return False
+        else:
+            logger.warning("MQTT client not connected, cannot publish to %s", topic)
+            return False
+    except Exception as exc:
+        logger.warning("MQTT publish failed for %s: %s", topic, exc)
+        return False
 
 
 class YOLOInference:
@@ -833,23 +957,20 @@ class OccupancyProcessor:
         return occupancy
 
 
-def forward_to_edge_processor(data: dict, edge_url: str = "http://localhost:5002") -> bool:
-    """Forward occupancy data to Edge Processor."""
-    import requests
-    try:
-        resp = requests.post(
-            f"{edge_url}/api/occupancy",
-            json=data,
-            timeout=2
-        )
-        return resp.status_code == 200
-    except Exception as e:
-        logger.debug(f"Failed to forward to Edge: {e}")
-        return False
+def forward_to_edge_processor(data: dict, zone: str) -> bool:
+    """Forward occupancy data to Edge Processor via MQTT."""
+    return _publish_to_edge_via_mqtt(data, zone)
 
 
-def run_server(port: int = 5001, model_path: Optional[str] = None, edge_url: str = "http://localhost:5002", reset_fsm: bool = False):
+def run_server(port: int = 5001, model_path: Optional[str] = None, reset_fsm: bool = False):
     """Start the RPi simulator HTTP server."""
+
+    # Initialize MQTT for RPi → Edge communication
+    mqtt_ok = _init_mqtt()
+    if mqtt_ok:
+        logger.info("MQTT client initialized for RPi → Edge forwarding")
+    else:
+        logger.warning("MQTT unavailable - Edge forwarding will not work")
 
     # Initialize components
     yolo = YOLOInference(model_path or MODEL_PATH)
@@ -1050,8 +1171,8 @@ def run_server(port: int = 5001, model_path: Optional[str] = None, edge_url: str
             sensor_id=sensor_id
         )
 
-        # Forward to Edge Processor
-        forwarded = forward_to_edge_processor(output, edge_url)
+        # Forward to Edge Processor via MQTT
+        forwarded = forward_to_edge_processor(output, zone)
 
         # Build response
         result = {
@@ -1137,7 +1258,7 @@ def run_server(port: int = 5001, model_path: Optional[str] = None, edge_url: str
         })
 
     logger.info(f"Starting RPi Simulator HTTP server on port {port}")
-    logger.info(f"Forwarding to Edge Processor at {edge_url}")
+    logger.info(f"Forwarding to Edge via MQTT broker at {MQTT_BROKER_HOST}:{MQTT_BROKER_PORT}")
 
     app.run(host="0.0.0.0", port=port, threaded=True, debug=False)
 
@@ -1146,7 +1267,6 @@ def main():
     parser = argparse.ArgumentParser(description="RPi Simulator HTTP Server")
     parser.add_argument("--port", type=int, default=5001, help="Port to listen on (default: 5001)")
     parser.add_argument("--model", type=str, default=None, help="Path to YOLO model")
-    parser.add_argument("--edge-url", type=str, default="http://localhost:5002", help="Edge Processor URL")
     parser.add_argument("--reset", action="store_true", help="Reset FSM state on startup (for fresh simulation)")
     args = parser.parse_args()
 
@@ -1164,7 +1284,7 @@ def main():
                 model_path = p
                 break
 
-    run_server(port=args.port, model_path=model_path, edge_url=args.edge_url, reset_fsm=args.reset)
+    run_server(port=args.port, model_path=model_path, reset_fsm=args.reset)
 
 
 if __name__ == "__main__":
