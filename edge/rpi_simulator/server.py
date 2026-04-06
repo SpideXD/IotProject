@@ -737,7 +737,7 @@ class EnhancedOutputBuilder:
 
             seats_output[seat_id] = {
                 "zone_id": zone,
-                "state": state_info.get("state", "empty"),
+                "ghost_state": state_info.get("state", "empty"),
                 "is_occupied": state_info.get("is_occupied", False),
                 "object_type": gt_info.get("object", "empty"),
                 "ghost_objects": gt_info.get("objects", []),  # Ghost objects left at seat

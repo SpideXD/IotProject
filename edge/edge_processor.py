@@ -278,14 +278,18 @@ def cleanup_expired_reservations():
 _room_patterns: Dict[str, dict] = {}  # room_id -> {last_pattern, seat_patterns}
 _room_correlation_lock = threading.Lock()
 
+# Track current seat states from RPi (updated on each process_occupancy call)
+_current_seat_states: Dict[str, dict] = {}  # seat_id -> state data
+_seat_states_lock = threading.Lock()
+
 
 def update_room_pattern(room_id: str, seats_data: dict):
     """Update pattern tracking for cross-room correlation."""
     with _room_correlation_lock:
-        # Count seat states in this room
+        # Count seat states in this room (use ghost_state from RPi)
         state_counts = {"empty": 0, "occupied": 0, "suspected_ghost": 0, "confirmed_ghost": 0}
         for seat_info in seats_data.values():
-            state = seat_info.get("state", "empty")
+            state = seat_info.get("ghost_state", seat_info.get("state", "empty"))
             if state in state_counts:
                 state_counts[state] += 1
 
@@ -313,7 +317,7 @@ def detect_cross_room_ghosts(current_room_id: str, seat_id: str, current_state: 
                 continue
             seats_data = pattern.get("seats_data", {})
             if seat_id in seats_data:
-                other_state = seats_data[seat_id].get("state", "empty")
+                other_state = seats_data[seat_id].get("ghost_state", seats_data[seat_id].get("state", "empty"))
                 if other_state == current_state:
                     cross_room_matches.append({
                         "room_id": room_id,
@@ -556,58 +560,47 @@ def process_occupancy(data: dict, request_id: str = None):
     # Update room pattern for cross-room correlation
     update_room_pattern(room_id, seats_data)
 
-    alerts: List[GhostAlert] = []
     state_updates: Dict[str, dict] = {}
 
     for seat_id, info in seats_data.items():
-        # Build CameraResult from RPi's processed data
-        obj_type = info.get("object_type", "empty")
-        conf = float(info.get("confidence", 0.0))
-        cam = CameraResult(
-            object_type=obj_type if conf > 0 else "empty",
-            confidence=conf,
-        )
+        # Trust RPi's ghost_state computation (RPi runs full FSM with time tracking)
+        # Edge only does cross-room correlation and aggregation
+        seat_state = info.get("ghost_state", "empty")
 
-        # Build RadarResult from RPi's enriched data
-        radar = RadarResult(
-            presence=float(info.get("radar_presence", 0.0)),
-            motion=float(info.get("radar_motion", 0.0)),
-            micro_motion=bool(info.get("has_motion", False)),
-        )
-
-        # Fuse camera and radar
-        fused = fusion.fuse(camera_result=cam, radar_result=radar)
-
-        # Update ghost detector for cross-room ghost detection
-        alert = ghost_detector.update(seat_id, fused)
-
-        # Check for cross-room correlation
-        seat_state = ghost_detector.get_state(seat_id).value
+        # Check for cross-room correlation using RPi's ghost_state
         if seat_state in ("suspected_ghost", "confirmed_ghost"):
             correlation = detect_cross_room_ghosts(room_id, seat_id, seat_state)
             if correlation:
                 logger.info("[%s] Cross-room correlation detected: %s", rid, correlation)
-
-        if alert is not None:
-            alerts.append(alert)
+                # Could adjust seat_state based on correlation here if needed
 
         zone_id = info.get("zone_id", SEAT_TO_ZONE.get(seat_id, ""))
 
+        # Forward RPi's computed values directly
         state_updates[seat_id] = {
             "seat_id": seat_id,
             "zone_id": zone_id,
             "state": seat_state,
-            "occupancy_score": fused.occupancy_score,
-            "object_type": fused.object_type,
-            "confidence": fused.confidence,
-            "is_present": fused.is_present,
-            "has_motion": fused.has_motion,
-            "radar_presence": fused.radar_presence,
-            "radar_motion": fused.radar_motion,
-            "radar_micro_motion": fused.radar_micro_motion,
+            "ghost_state": seat_state,  # Include for downstream compatibility
+            "occupancy_score": info.get("radar_presence", 0.0),
+            "object_type": info.get("object_type", "empty"),
+            "confidence": info.get("confidence", 0.0),
+            "is_present": info.get("is_occupied", False),
+            "has_motion": info.get("has_motion", False),
+            "radar_presence": info.get("radar_presence", 0.0),
+            "radar_motion": info.get("radar_motion", 0.0),
+            "radar_micro_motion": info.get("radar_micro_motion", False),
+            "dwell_time": info.get("dwell_time", 0),
+            "time_since_motion": info.get("time_since_motion", 0),
+            "ghost_duration": info.get("ghost_duration", 0),
             "timestamp": timestamp,
             "source_room": room_id,
         }
+
+    # Update global seat states for API queries
+    with _seat_states_lock:
+        for seat_id, state_data in state_updates.items():
+            _current_seat_states[seat_id] = state_data
 
     # Check for duplicates
     if _is_duplicate_state(state_updates):
@@ -618,12 +611,8 @@ def process_occupancy(data: dict, request_id: str = None):
     # Publish state updates
     _publish_state_updates(state_updates, rid)
 
-    # Queue alerts for batching
-    for alert in alerts:
-        _queue_alert(alert)
-
-    # Write to InfluxDB
-    _write_to_influxdb(state_updates, alerts)
+    # Write to InfluxDB (alerts from RPi path handled separately by RPi itself)
+    _write_to_influxdb(state_updates, [])
 
 
 def process_telemetry(data: dict):
@@ -1009,8 +998,10 @@ def _run_http_server():
         if request.method == "POST":
             return jsonify({"ok": True, "request_id": request.request_id})
 
-        # Get current ghost states
-        states = ghost_detector.get_all_states()
+        # Get current ghost states from RPi data
+        with _seat_states_lock:
+            states = {seat_id: data.get("ghost_state", data.get("state", "empty"))
+                      for seat_id, data in _current_seat_states.items()}
 
         # Count by state
         occupied = sum(1 for v in states.values() if v == "occupied")
@@ -1037,16 +1028,21 @@ def _run_http_server():
     @app.route("/api/state/<seat_id>", methods=["GET"])
     def api_seat_state(seat_id):
         """Get detailed state for a specific seat."""
-        rec = ghost_detector.get_seat_record(seat_id)
+        with _seat_states_lock:
+            seat_data = _current_seat_states.get(seat_id, {})
         reservation = get_reservation(seat_id)
         return jsonify({
             "seat_id": seat_id,
-            "state": rec.state.value,
-            "last_motion_time": rec.last_motion_time,
-            "state_entered_time": rec.state_entered_time,
-            "last_update_time": rec.last_update_time,
-            "last_object_type": rec.last_object_type,
-            "last_occupancy_score": rec.last_occupancy_score,
+            "state": seat_data.get("ghost_state", seat_data.get("state", "empty")),
+            "object_type": seat_data.get("object_type", "empty"),
+            "confidence": seat_data.get("confidence", 0.0),
+            "is_present": seat_data.get("is_present", False),
+            "has_motion": seat_data.get("has_motion", False),
+            "dwell_time": seat_data.get("dwell_time", 0),
+            "time_since_motion": seat_data.get("time_since_motion", 0),
+            "ghost_duration": seat_data.get("ghost_duration", 0),
+            "zone_id": seat_data.get("zone_id", SEAT_TO_ZONE.get(seat_id, "")),
+            "source_room": seat_data.get("source_room", ""),
             "reservation": reservation,
             "request_id": request.request_id,
         })
@@ -1055,18 +1051,20 @@ def _run_http_server():
     def api_all_seats():
         """Get state for all seats with optional filtering."""
         state_filter = request.args.get("filter")  # empty, occupied, suspected, confirmed
-        states = ghost_detector.get_all_states()
+        with _seat_states_lock:
+            seat_states = {seat_id: data.get("ghost_state", data.get("state", "empty"))
+                          for seat_id, data in _current_seat_states.items()}
 
         result = {}
-        for seat_id, state in states.items():
+        for seat_id, state in seat_states.items():
             if state_filter and state != state_filter:
                 continue
-            rec = ghost_detector.get_seat_record(seat_id)
+            seat_data = _current_seat_states.get(seat_id, {})
             result[seat_id] = {
                 "state": state,
-                "occupancy_score": rec.last_occupancy_score,
-                "object_type": rec.last_object_type,
-                "last_motion_time": rec.last_motion_time,
+                "occupancy_score": seat_data.get("occupancy_score", 0.0),
+                "object_type": seat_data.get("object_type", "empty"),
+                "dwell_time": seat_data.get("dwell_time", 0),
                 "reservation": get_reservation(seat_id),
             }
 
@@ -1167,7 +1165,9 @@ def _run_http_server():
     @app.route("/metrics", methods=["GET"])
     def metrics():
         """Prometheus-style metrics endpoint with enhanced details."""
-        states = ghost_detector.get_all_states()
+        with _seat_states_lock:
+            states = {seat_id: data.get("ghost_state", data.get("state", "empty"))
+                     for seat_id, data in _current_seat_states.items()}
         occupied = sum(1 for v in states.values() if v == "occupied")
         suspected = sum(1 for v in states.values() if v == "suspected_ghost")
         confirmed = sum(1 for v in states.values() if v == "confirmed_ghost")
@@ -1288,7 +1288,9 @@ def _run_http_server():
     @app.route("/api/analytics/utilization", methods=["GET"])
     def api_utilization():
         """Get zone utilization analytics."""
-        states = ghost_detector.get_all_states()
+        with _seat_states_lock:
+            states = {seat_id: data.get("ghost_state", data.get("state", "empty"))
+                     for seat_id, data in _current_seat_states.items()}
         result = {}
         for zone_id, seats in ZONE_TO_SEATS.items():
             zone_states = [states.get(sid, "empty") for sid in seats]
@@ -1339,7 +1341,9 @@ def _log_stats_periodically(interval: float = 30.0):
         # Cleanup expired reservations
         expired_count = cleanup_expired_reservations()
 
-        states = ghost_detector.get_all_states()
+        with _seat_states_lock:
+            states = {seat_id: data.get("ghost_state", data.get("state", "empty"))
+                     for seat_id, data in _current_seat_states.items()}
         occupied = sum(1 for v in states.values() if v == "occupied")
         suspected = sum(1 for v in states.values() if v == "suspected_ghost")
         confirmed = sum(1 for v in states.values() if v == "confirmed_ghost")
