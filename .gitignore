@@ -1,0 +1,38 @@
+# Unity
+LibraryModel/Library/
+LibraryModel/Temp/
+LibraryModel/Logs/
+LibraryModel/obj/
+LibraryModel/UserSettings/
+LibraryModel/*.csproj
+LibraryModel/*.sln*
+LibraryModel/.vscode/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+.venv/
+.pytest_cache/
+
+# YOLO models (large binary files - don't track)
+*.pt
+
+# Synthetic training data (large datasets - don't track)
+synthetic_data*/
+*_data*/
+
+# Videos and screenshots
+*.mp4
+*.png
+!docs/*.png
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific large files
+issue.png
+*.zip

@@ -1,0 +1,5 @@
+paho-mqtt>=2.0
+opencv-python>=4.8
+influxdb-client>=1.40
+flask>=3.0
+numpy

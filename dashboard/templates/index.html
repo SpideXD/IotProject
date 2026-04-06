@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Liberty Twin - IoT Library Monitor</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📡</text></svg>">
+</head>
+<body>
+
+<div class="dashboard">
+
+
+    <header class="header">
+        <div class="header-left">
+            <div class="logo">LIBERTY <span>TWIN</span></div>
+            <span class="mqtt-badge" id="mqtt-badge">WEBSOCKET</span>
+            <div class="room-selector" id="room-selector">
+                <select id="room-select">
+                    <option value="room_1">Main Library</option>
+                    <option value="room_2">Study Hall</option>
+                    <option value="room_3">Reference Section</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="header-center" id="sensor-indicators">
+
+        </div>
+
+        <div class="header-right">
+            <button class="theme-toggle" id="theme-toggle" title="Toggle theme">
+                <span id="theme-icon">🌙</span>
+            </button>
+            <button class="sound-toggle" id="sound-toggle" title="Toggle sound">
+                <span id="sound-icon">🔔</span>
+            </button>
+            <div class="live-clock" id="live-clock">--:--:--</div>
+            <div class="connection-status disconnected" id="connection-status">
+                <span class="dot"></span> CONNECTING
+            </div>
+        </div>
+    </header>
+
+
+    <section class="camera-section">
+
+        <div class="camera-panel" id="camera-panel-back">
+            <img id="camera-img-back" src="" alt="Back Rail Feed" style="display:none;">
+            <div class="camera-placeholder">
+                <div style="text-align:center">
+                    <div class="icon-large">&#x1F4F7;</div>
+                    <div>Back Rail Camera</div>
+                    <div style="font-size:.7rem;color:var(--text-muted);margin-top:4px">Awaiting feed...</div>
+                </div>
+            </div>
+            <div class="camera-overlay" id="camera-overlay-back_rail">
+                <div class="camera-label">
+                    Back Rail
+                    <span class="zone-sub">Initializing...</span>
+                </div>
+                <span class="status-badge offline">IDLE</span>
+            </div>
+        </div>
+
+
+        <div class="camera-panel" id="camera-panel-front">
+            <img id="camera-img-front" src="" alt="Front Rail Feed" style="display:none;">
+            <div class="camera-placeholder">
+                <div style="text-align:center">
+                    <div class="icon-large">&#x1F4F7;</div>
+                    <div>Front Rail Camera</div>
+                    <div style="font-size:.7rem;color:var(--text-muted);margin-top:4px">Awaiting feed...</div>
+                </div>
+            </div>
+            <div class="camera-overlay" id="camera-overlay-front_rail">
+                <div class="camera-label">
+                    Front Rail
+                    <span class="zone-sub">Initializing...</span>
+                </div>
+                <span class="status-badge offline">IDLE</span>
+            </div>
+        </div>
+    </section>
+
+
+    <section class="zone-section">
+        <div class="card">
+            <div class="card-title">
+                <span class="icon">&#x1F4CA;</span> Zone Occupancy
+                <div class="card-actions">
+                    <button class="btn-icon" id="btn-heatmap" title="Toggle Heatmap">&#x1F321;</button>
+                    <button class="btn-icon" id="btn-export" title="Export Data">&#x2B07;</button>
+                </div>
+            </div>
+            <div class="zone-grid" id="zone-grid">
+
+            </div>
+            <div class="heatmap-legend" id="heatmap-legend" style="display:none;">
+                <span class="heatmap-label">Low</span>
+                <div class="heatmap-gradient"></div>
+                <span class="heatmap-label">High</span>
+            </div>
+        </div>
+    </section>
+
+
+    <section class="main-grid">
+
+        <div class="card">
+            <div class="card-title"><span class="icon">&#x1F4BA;</span> Seat Status Map <span style="margin-left:auto;font-weight:400;color:var(--text-muted);text-transform:none;letter-spacing:0">28 seats</span></div>
+            <div class="seat-grid" id="seat-grid">
+
+            </div>
+            <div style="display:flex;gap:16px;margin-top:16px;justify-content:center;flex-wrap:wrap">
+                <div style="display:flex;align-items:center;gap:5px;font-size:.7rem;color:var(--text-muted)">
+                    <span style="width:10px;height:10px;border-radius:50%;background:#22c55e;display:inline-block"></span> Empty
+                </div>
+                <div style="display:flex;align-items:center;gap:5px;font-size:.7rem;color:var(--text-muted)">
+                    <span style="width:10px;height:10px;border-radius:50%;background:#ef4444;display:inline-block"></span> Occupied
+                </div>
+                <div style="display:flex;align-items:center;gap:5px;font-size:.7rem;color:var(--text-muted)">
+                    <span style="width:10px;height:10px;border-radius:50%;background:#eab308;display:inline-block"></span> Suspected
+                </div>
+                <div style="display:flex;align-items:center;gap:5px;font-size:.7rem;color:var(--text-muted)">
+                    <span style="width:10px;height:10px;border-radius:50%;background:#a855f7;display:inline-block"></span> Ghost
+                </div>
+            </div>
+        </div>
+
+
+        <div class="card">
+            <div class="card-title"><span class="icon">&#x1F4E1;</span> Radar Presence Readings</div>
+            <div class="radar-list" id="radar-list">
+
+            </div>
+        </div>
+    </section>
+
+
+    <section class="alert-section">
+        <div class="card">
+            <div class="card-title">
+                <span class="icon">&#x1F47B;</span> Ghost Alert Feed
+                <div class="card-actions">
+                    <button class="btn-icon" id="btn-show-acked" title="Show Acknowledged">&#x2714;</button>
+                    <span class="alert-count-badge" id="alert-count">0</span>
+                </div>
+            </div>
+            <div class="alert-feed" id="alert-feed">
+                <div class="alert-empty">No alerts yet. System monitoring...</div>
+            </div>
+        </div>
+    </section>
+
+
+    <section class="chart-section">
+        <div class="card">
+            <div class="card-title">
+                <span class="icon">&#x1F4C8;</span> Occupancy History
+                <span style="margin-left:auto;font-weight:400;color:var(--text-muted);text-transform:none;letter-spacing:0" id="history-range">Last 1 hour</span>
+                <div class="card-actions">
+                    <button class="btn-icon" id="btn-1h">1H</button>
+                    <button class="btn-icon" id="btn-6h">6H</button>
+                    <button class="btn-icon" id="btn-24h">24H</button>
+                </div>
+            </div>
+            <div class="chart-container">
+                <canvas id="history-chart"></canvas>
+            </div>
+        </div>
+    </section>
+
+
+    <section class="analytics-section" id="analytics-section" style="display:none;">
+        <div class="card">
+            <div class="card-title"><span class="icon">&#x1F4CA;</span> Zone Utilization Analytics</div>
+            <div class="analytics-grid" id="analytics-grid">
+            </div>
+        </div>
+    </section>
+
+
+    <footer class="stats-bar">
+        <div class="stat-item">
+            <div class="stat-value occupied" id="stat-occupied">0</div>
+            <div class="stat-label">Occupied</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-value empty" id="stat-empty">0</div>
+            <div class="stat-label">Empty</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-value ghost" id="stat-ghost">0</div>
+            <div class="stat-label">Ghost</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-value scans" id="stat-scans">0</div>
+            <div class="stat-label">Total Scans</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-value util" id="stat-util">0.0%</div>
+            <div class="stat-label">Utilization</div>
+        </div>
+    </footer>
+
+</div>
+
+<div class="seat-tooltip" id="seat-tooltip"></div>
+
+<!-- Seat Detail Modal -->
+<div class="modal" id="seat-modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3 id="modal-seat-id">Seat S1</h3>
+            <button class="modal-close" id="modal-close">&times;</button>
+        </div>
+        <div class="modal-body" id="modal-body">
+            <!-- Seat details populated by JS -->
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-primary" id="modal-reserve">Reserve Seat</button>
+        </div>
+    </div>
+</div>
+
+<!-- Export Modal -->
+<div class="modal" id="export-modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3>Export Data</h3>
+            <button class="modal-close" id="export-modal-close">&times;</button>
+        </div>
+        <div class="modal-body">
+            <div class="form-group">
+                <label>Data Type</label>
+                <select id="export-type">
+                    <option value="history">Occupancy History</option>
+                    <option value="seats">Current Seat States</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Time Range (minutes)</label>
+                <select id="export-time">
+                    <option value="60">Last 1 hour</option>
+                    <option value="360">Last 6 hours</option>
+                    <option value="1440">Last 24 hours</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Format</label>
+                <select id="export-format">
+                    <option value="csv">CSV</option>
+                    <option value="json">JSON</option>
+                </select>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" id="export-cancel">Cancel</button>
+            <button class="btn btn-primary" id="export-download">Download</button>
+        </div>
+    </div>
+</div>
+
+<audio id="alert-sound" preload="auto">
+    <source src="data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2teleQIAE3eJ4Pl7AAAUiIqmtrQAAA6Di9T8owAAGoeM0vmiAAEgiIvO+6EAAQ6IjMr3oAAAH4mLxvOdAAAfiYvG7pwAAC6KisbsmwAALYqKw+2aAAAtiorD7poAACqKisHtmgAAK4qKwe2aAAApiorB7ZoAACqKisHtmgAAK4qKwe2aAAApiorB7ZoAACuKisHtmgAAKoqKwe2aAAAoioq" type="audio/wav">
+</audio>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<script src="https://cdn.socket.io/4.8.1/socket.io.min.js"></script>
+
+<script src="/static/js/dashboard.js"></script>
+
+</body>
+</html>
