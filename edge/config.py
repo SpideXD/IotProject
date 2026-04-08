@@ -35,14 +35,12 @@ HTTP_FALLBACK_PORT = 5002
 LOG_LEVEL = "INFO"
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 
-# Heatmap configuration
-HEATMAP_UPDATE_INTERVAL = 5  # seconds (for future use)
+HEATMAP_UPDATE_INTERVAL = 5
 
-# Ghost Detection Parameters
-GHOST_GRACE_PERIOD = 30.0  # seconds before suspected_ghost
-GHOST_THRESHOLD = 120.0     # seconds before confirmed_ghost
-PRESENCE_THRESHOLD = 0.5     # radar presence to consider occupied
-MOTION_THRESHOLD = 0.3       # motion to indicate active person
-CAMERA_WEIGHT = 0.6          # weight for camera in fusion
-RADAR_WEIGHT = 0.4           # weight for radar in fusion
-AGREEMENT_BONUS = 0.1        # bonus when camera and radar agree
+GHOST_GRACE_PERIOD = 30.0
+GHOST_THRESHOLD = 120.0
+PRESENCE_THRESHOLD = 0.5
+MOTION_THRESHOLD = 0.3
+CAMERA_WEIGHT = 0.6
+RADAR_WEIGHT = 0.4
+AGREEMENT_BONUS = 0.1

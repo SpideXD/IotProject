@@ -13,7 +13,6 @@ Usage:
 import argparse
 import base64
 import io
-import json
 import logging
 import os
 import sys
@@ -30,13 +29,6 @@ from rpi_simulator.config import (
     CLASS_NAMES,
     CONF_THRESHOLD,
 )
-
-# MQTT Configuration for RPi → Edge communication
-MQTT_BROKER_HOST = os.environ.get("MQTT_HOST", "localhost")
-MQTT_BROKER_PORT = int(os.environ.get("MQTT_PORT", 1883))
-MQTT_CLIENT_ID = f"liberty_twin_rpi_{os.getpid()}"
-MQTT_KEEPALIVE = 60
-MQTT_TOPIC_RPI_OCCUPANCY = "liberty_twin/sensor/{zone}/occupancy"  # RPi publishes here
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,122 +51,6 @@ try:
 except ImportError:
     ULTRALYTICS_AVAILABLE = False
     logger.warning("ultralytics not installed. YOLO inference disabled.")
-
-
-# =============================================================================
-# MQTT Client for RPi → Edge Communication
-# =============================================================================
-
-mqtt_client = None
-_mqtt_reconnect_delay = 1.0
-_mqtt_max_reconnect_delay = 30.0
-
-
-def _should_reconnect_mqtt() -> bool:
-    global mqtt_client
-    if mqtt_client is None:
-        return True
-    if not hasattr(mqtt_client, 'is_connected'):
-        return True
-    return not mqtt_client.is_connected()
-
-
-def _attempt_mqtt_reconnect():
-    global _mqtt_reconnect_delay
-    if not _should_reconnect_mqtt():
-        return
-    try:
-        if mqtt_client:
-            mqtt_client.reconnect()
-            _mqtt_reconnect_delay = 1.0  # Reset on success
-    except Exception as exc:
-        logger.warning("MQTT reconnect failed: %s", exc)
-        _mqtt_reconnect_delay = min(_mqtt_reconnect_delay * 2, _mqtt_max_reconnect_delay)
-
-
-def _mqtt_reconnect_worker():
-    global _mqtt_reconnect_delay
-    while True:
-        time.sleep(_mqtt_reconnect_delay)
-        if _should_reconnect_mqtt():
-            _attempt_mqtt_reconnect()
-
-
-_mqtt_reconnect_thread = None
-
-
-def _start_mqtt_reconnect_worker():
-    global _mqtt_reconnect_thread
-    _mqtt_reconnect_thread = threading.Thread(target=_mqtt_reconnect_worker, daemon=True)
-    _mqtt_reconnect_thread.start()
-
-
-def _on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
-    if reason_code.is_failure:
-        logger.warning("MQTT connection refused: %s", reason_code)
-    else:
-        global _mqtt_reconnect_delay
-        _mqtt_reconnect_delay = 1.0  # Reset backoff on successful connection
-        logger.info("MQTT connected to %s:%s", MQTT_BROKER_HOST, MQTT_BROKER_PORT)
-
-
-def _on_mqtt_disconnect(client, userdata, flags, reason_code=None, properties=None):
-    global _mqtt_reconnect_delay
-    _mqtt_reconnect_delay = 1.0  # Reset on disconnect
-    logger.warning("MQTT disconnected (rc=%s). Will retry with backoff.", reason_code)
-
-
-def _init_mqtt() -> bool:
-    global mqtt_client
-    try:
-        import paho.mqtt.client as paho_mqtt
-        try:
-            # Version 2.x API
-            client = paho_mqtt.Client(
-                callback_api_version=paho_mqtt.CallbackAPIVersion.VERSION2,
-                client_id=MQTT_CLIENT_ID,
-            )
-        except (AttributeError, TypeError):
-            # Fallback to version 1.x API
-            client = paho_mqtt.Client(client_id=MQTT_CLIENT_ID)
-
-        client.on_connect = _on_mqtt_connect
-        client.on_disconnect = _on_mqtt_disconnect
-
-        client.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT, MQTT_KEEPALIVE)
-        client.loop_start()
-        mqtt_client = client
-        _start_mqtt_reconnect_worker()  # Start background reconnection worker
-        return True
-    except ImportError:
-        logger.warning("paho-mqtt not installed. MQTT disabled.")
-        return False
-    except Exception as exc:
-        logger.warning("Cannot connect to MQTT broker at %s:%s (%s). MQTT disabled.",
-                       MQTT_BROKER_HOST, MQTT_BROKER_PORT, exc)
-        return False
-
-
-def _publish_to_edge_via_mqtt(data: dict, zone: str) -> bool:
-    """Publish occupancy data to Edge via MQTT."""
-    global mqtt_client
-    topic = MQTT_TOPIC_RPI_OCCUPANCY.format(zone=zone)
-    try:
-        if mqtt_client is not None and mqtt_client.is_connected():
-            payload = json.dumps(data)
-            result = mqtt_client.publish(topic, payload, qos=1)
-            if result.is_published:
-                logger.debug("Published occupancy to %s", topic)
-                return True
-            else:
-                logger.warning("MQTT publish to %s returned %s", topic, result)
-                return False
-        else:
-            logger.warning("MQTT client not connected, cannot publish to %s", topic)
-            return False
-    except Exception as exc:
-        logger.warning("MQTT publish failed for %s: %s", topic, exc)
-        return False
 
 
 class YOLOInference:
@@ -255,6 +131,87 @@ class YOLOInference:
             except Exception as e:
                 logger.error(f"YOLO inference error: {e}")
                 return []
+
+    def infer_with_annotated_frame(self, frame_bytes: bytes) -> tuple:
+        """
+        Run YOLO inference and return detections + annotated frame.
+
+        Args:
+            frame_bytes: JPEG image data
+
+        Returns:
+            Tuple of (detections, annotated_frame_base64)
+        """
+        if self.model is None:
+            return [], None
+
+        with self._lock:
+            try:
+                # Decode image
+                nparr = np.frombuffer(frame_bytes, np.uint8)
+                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                if img is None:
+                    return [], None
+
+                # Run inference with plot (returns annotated image)
+                results = self.model(img, conf=self.conf_threshold, verbose=False)
+
+                detections = []
+                annotated_img = img.copy()
+
+                for r in results:
+                    boxes = r.boxes
+                    for box in boxes:
+                        cls_id = int(box.cls[0])
+                        conf = float(box.conf[0])
+
+                        # Get bounding box (xyxy format)
+                        x1, y1, x2, y2 = box.xyxy[0].tolist()
+
+                        detections.append({
+                            "class_id": cls_id,
+                            "class_name": CLASS_NAMES[cls_id] if cls_id < len(CLASS_NAMES) else "unknown",
+                            "confidence": round(conf, 4),
+                            "bbox": {
+                                "x1": round(x1, 1),
+                                "y1": round(y1, 1),
+                                "x2": round(x2, 1),
+                                "y2": round(y2, 1),
+                            }
+                        })
+
+                        # Draw box on annotated image
+                        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                        label = f"{CLASS_NAMES[cls_id] if cls_id < len(CLASS_NAMES) else 'unknown'} {conf:.2f}"
+
+                        # Color based on class
+                        if cls_id == 0:  # person
+                            color = (0, 255, 0)  # Green
+                        elif cls_id == 1:  # bag
+                            color = (255, 0, 255)  # Magenta
+                        else:
+                            color = (0, 255, 255)  # Yellow
+
+                        # Draw rectangle
+                        cv2.rectangle(annotated_img, (x1, y1), (x2, y2), color, 2)
+
+                        # Draw label background
+                        (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                        cv2.rectangle(annotated_img, (x1, y1 - label_h - 10), (x1 + label_w, y1), color, -1)
+
+                        # Draw label text
+                        cv2.putText(annotated_img, label, (x1, y1 - 5),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+
+                # Encode annotated image to JPEG
+                _, buffer = cv2.imencode('.jpg', annotated_img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                annotated_b64 = base64.b64encode(buffer).decode('utf-8')
+
+                return detections, annotated_b64
+
+            except Exception as e:
+                logger.error(f"YOLO inference error: {e}")
+                return [], None
 
 
 class ImageGhostDetector:
@@ -861,7 +818,7 @@ class EnhancedOutputBuilder:
 
             seats_output[seat_id] = {
                 "zone_id": zone,
-                "ghost_state": state_info.get("state", "empty"),
+                "state": state_info.get("state", "empty"),
                 "is_occupied": state_info.get("is_occupied", False),
                 "object_type": gt_info.get("object", "empty"),
                 "ghost_objects": gt_info.get("objects", []),  # Ghost objects left at seat
@@ -957,20 +914,23 @@ class OccupancyProcessor:
         return occupancy
 
 
-def forward_to_edge_processor(data: dict, zone: str) -> bool:
-    """Forward occupancy data to Edge Processor via MQTT."""
-    return _publish_to_edge_via_mqtt(data, zone)
+def forward_to_edge_processor(data: dict, edge_url: str = "http://localhost:5002") -> bool:
+    """Forward occupancy data to Edge Processor."""
+    import requests
+    try:
+        resp = requests.post(
+            f"{edge_url}/api/occupancy",
+            json=data,
+            timeout=2
+        )
+        return resp.status_code == 200
+    except Exception as e:
+        logger.debug(f"Failed to forward to Edge: {e}")
+        return False
 
 
-def run_server(port: int = 5001, model_path: Optional[str] = None, reset_fsm: bool = False):
+def run_server(port: int = 5001, model_path: Optional[str] = None, edge_url: str = "http://localhost:5002", reset_fsm: bool = False):
     """Start the RPi simulator HTTP server."""
-
-    # Initialize MQTT for RPi → Edge communication
-    mqtt_ok = _init_mqtt()
-    if mqtt_ok:
-        logger.info("MQTT client initialized for RPi → Edge forwarding")
-    else:
-        logger.warning("MQTT unavailable - Edge forwarding will not work")
 
     # Initialize components
     yolo = YOLOInference(model_path or MODEL_PATH)
@@ -1000,15 +960,27 @@ def run_server(port: int = 5001, model_path: Optional[str] = None, reset_fsm: bo
     if not yolo_loaded:
         logger.warning("YOLO model not loaded. Inference disabled.")
 
+    # Latest live frame storage for /api/live-frame endpoint
+    _latest_live_frame = {
+        "frame": None,
+        "detections": [],
+        "timestamp": 0,
+        "sensor_id": None,
+        "zone": None,
+    }
+    _live_frame_lock = threading.Lock()
+
     # Import Flask
     try:
         from flask import Flask, request, jsonify
+        from flask_cors import CORS
     except ImportError:
         logger.error("Flask not installed. Run: pip install flask")
         return
 
     app = Flask("rpi_simulator")
     app.logger.setLevel(logging.INFO)
+    CORS(app)
 
     @app.route("/health", methods=["GET"])
     def health():
@@ -1113,8 +1085,17 @@ def run_server(port: int = 5001, model_path: Optional[str] = None, reset_fsm: bo
 
         # Run YOLO inference (even with GT available, we want YOLO comparison)
         detections = []
+        annotated_frame = None
         if yolo_loaded and frame_bytes:
-            detections = yolo.infer(frame_bytes)
+            detections, annotated_frame = yolo.infer_with_annotated_frame(frame_bytes)
+
+            # Update live frame for /api/live-frame endpoint
+            with _live_frame_lock:
+                _latest_live_frame["frame"] = annotated_frame
+                _latest_live_frame["detections"] = detections
+                _latest_live_frame["timestamp"] = time.time()
+                _latest_live_frame["sensor_id"] = sensor_id
+                _latest_live_frame["zone"] = zone
 
         # Run ghost detection (legacy - still useful for verification)
         ghosts = image_ghost_detector.detect_ghosts(frame_bytes) if frame_bytes else []
@@ -1171,8 +1152,8 @@ def run_server(port: int = 5001, model_path: Optional[str] = None, reset_fsm: bo
             sensor_id=sensor_id
         )
 
-        # Forward to Edge Processor via MQTT
-        forwarded = forward_to_edge_processor(output, zone)
+        # Forward to Edge Processor
+        forwarded = forward_to_edge_processor(output, edge_url)
 
         # Build response
         result = {
@@ -1219,6 +1200,41 @@ def run_server(port: int = 5001, model_path: Optional[str] = None, reset_fsm: bo
             "seats": seat_states
         })
 
+    @app.route("/api/live-frame", methods=["GET"])
+    def get_live_frame():
+        """
+        Get the latest annotated frame with YOLO detections.
+        Used by the dashboard deep dive view to display real-time camera feed.
+
+        Returns:
+            {
+                "frame": "base64_jpeg_data",
+                "detections": [...],
+                "timestamp": 1234567890.123,
+                "sensor_id": "Rail_Back",
+                "zone": "Z1"
+            }
+        """
+        with _live_frame_lock:
+            if _latest_live_frame["frame"] is None:
+                return jsonify({
+                    "frame": None,
+                    "detections": [],
+                    "timestamp": 0,
+                    "sensor_id": None,
+                    "zone": None,
+                    "has_frame": False,
+                }), 200
+
+            return jsonify({
+                "frame": _latest_live_frame["frame"],
+                "detections": _latest_live_frame["detections"],
+                "timestamp": _latest_live_frame["timestamp"],
+                "sensor_id": _latest_live_frame["sensor_id"],
+                "zone": _latest_live_frame["zone"],
+                "has_frame": _latest_live_frame["frame"] is not None,
+            }), 200
+
     @app.route("/api/detect", methods=["POST"])
     def detect():
         """Simple detection endpoint - just YOLO, no occupancy processing."""
@@ -1258,7 +1274,7 @@ def run_server(port: int = 5001, model_path: Optional[str] = None, reset_fsm: bo
         })
 
     logger.info(f"Starting RPi Simulator HTTP server on port {port}")
-    logger.info(f"Forwarding to Edge via MQTT broker at {MQTT_BROKER_HOST}:{MQTT_BROKER_PORT}")
+    logger.info(f"Forwarding to Edge Processor at {edge_url}")
 
     app.run(host="0.0.0.0", port=port, threaded=True, debug=False)
 
@@ -1267,6 +1283,7 @@ def main():
     parser = argparse.ArgumentParser(description="RPi Simulator HTTP Server")
     parser.add_argument("--port", type=int, default=5001, help="Port to listen on (default: 5001)")
     parser.add_argument("--model", type=str, default=None, help="Path to YOLO model")
+    parser.add_argument("--edge-url", type=str, default="http://localhost:5002", help="Edge Processor URL")
     parser.add_argument("--reset", action="store_true", help="Reset FSM state on startup (for fresh simulation)")
     args = parser.parse_args()
 
@@ -1284,7 +1301,7 @@ def main():
                 model_path = p
                 break
 
-    run_server(port=args.port, model_path=model_path, reset_fsm=args.reset)
+    run_server(port=args.port, model_path=model_path, edge_url=args.edge_url, reset_fsm=args.reset)
 
 
 if __name__ == "__main__":

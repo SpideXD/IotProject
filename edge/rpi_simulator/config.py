@@ -12,7 +12,7 @@ IMAGES_DIR = os.path.join(SYNTHETIC_DATA_ROOT, "images")
 LABELS_DIR = os.path.join(SYNTHETIC_DATA_ROOT, "labels")
 DATA_YAML = os.path.join(SYNTHETIC_DATA_MERGED, "dataset.yaml")
 OUTPUT_DIR = os.path.join(SYNTHETIC_DATA_MERGED, "runs")
-MODEL_PATH = os.path.join(SYNTHETIC_DATA_MERGED, "custom_yolo.pt")
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "best.pt")
 
 # YOLO classes (must match Unity ground truth)
 # These map to what Unity exports in labels

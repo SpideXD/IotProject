@@ -1,25 +1,5 @@
-#!/usr/bin/env python3
-"""
-Edge Processor - Central hub that receives occupancy data from RPi simulators.
 
-Receives pre-computed seat occupancy from per-room RPi simulators.
-Performs cross-room ghost detection, sensor fusion, and forwards to dashboard.
-No raw camera images ever arrive here (privacy preserved).
 
-Features:
-- Ghost detection FSM with 4 states (empty → occupied → suspected_ghost → confirmed_ghost)
-- Sensor fusion (camera + radar with 60/40 weighting + agreement bonus)
-- Multi-room correlation for cross-room ghost detection
-- MQTT publishing to dashboard with HTTP fallback
-- InfluxDB batch writes for historical data
-- Alert batching to reduce noise
-- State deduplication via hash comparison
-- API rate limiting for protection
-- Request ID tracking for distributed tracing
-- Seat reservation system
-- Prometheus-style metrics with enhanced details
-- Health/readiness endpoints for Kubernetes
-"""
 import hashlib
 import os
 import json
@@ -64,25 +44,17 @@ from ghost_detector import GhostDetector, GhostAlert
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format=LOG_FORMAT)
 logger = logging.getLogger("edge_processor")
 
-# =============================================================================
-# Global State
-# =============================================================================
-
 mqtt_client = None
 influx_client = None
 influx_write_api = None
 
-# Track RPi sources
 _rpi_sources: Dict[str, dict] = {}
 
-# Ghost detector and sensor fusion
 fusion = SensorFusion()
 ghost_detector = GhostDetector()
 
-# Dashboard HTTP URL
 HTTP_DASHBOARD_URL = os.environ.get("HTTP_DASHBOARD_URL", "http://localhost:5000/api/seat_state")
 
-# Stats - using list instead of set for JSON serialization
 _stats = {
     "occupancy_count": 0,
     "telemetry_count": 0,
@@ -90,7 +62,7 @@ _stats = {
     "mqtt_publishes": 0,
     "influx_writes": 0,
     "http_fallbacks": 0,
-    "rpi_sources": [],  # List, not set (JSON serializable)
+    "rpi_sources": [],
     "alerts_batched": 0,
     "alerts_sent": 0,
     "duplicates_skipped": 0,
@@ -98,41 +70,32 @@ _stats = {
     "request_errors": 0,
 }
 
-# State deduplication
 _last_state_hash: str = ""
 _state_hash_lock = threading.Lock()
 
-# Alert batching
 _alert_batch: List[GhostAlert] = []
 _alert_batch_lock = threading.Lock()
 _ALERT_BATCH_SIZE = 5
-_ALERT_BATCH_TIMEOUT = 2.0  # seconds
+_ALERT_BATCH_TIMEOUT = 2.0
 
-# InfluxDB batch buffer
 _influx_batch: List = []
 _influx_batch_lock = threading.Lock()
 _INFLUX_BATCH_SIZE = 20
-_INFLUX_BATCH_TIMEOUT = 5.0  # seconds
+_INFLUX_BATCH_TIMEOUT = 5.0
 
-# Last flush times
 _last_alert_flush = time.time()
 _last_influx_flush = time.time()
 
-# =============================================================================
-# Rate Limiting
-# =============================================================================
-
-_RATE_LIMIT_WINDOW = 60.0  # 1 minute window
-_RATE_LIMIT_MAX_REQUESTS = 1000  # per window
+_RATE_LIMIT_WINDOW = 60.0
+_RATE_LIMIT_MAX_REQUESTS = 1000
 _rate_limit_storage: Dict[str, List[float]] = defaultdict(list)
 _rate_limit_lock = threading.Lock()
-
 
 def check_rate_limit(client_id: str = "default") -> bool:
     """Check if request is within rate limit. Returns True if allowed."""
     now = time.time()
     with _rate_limit_lock:
-        # Clean old entries
+
         _rate_limit_storage[client_id] = [
             t for t in _rate_limit_storage[client_id] if now - t < _RATE_LIMIT_WINDOW
         ]
@@ -143,7 +106,6 @@ def check_rate_limit(client_id: str = "default") -> bool:
 
         _rate_limit_storage[client_id].append(now)
         return True
-
 
 def rate_limit(client_id: str = "default"):
     """Decorator for rate limiting endpoints."""
@@ -156,39 +118,24 @@ def rate_limit(client_id: str = "default"):
         return wrapper
     return decorator
 
-# =============================================================================
-# Request ID Tracking
-# =============================================================================
-
 _request_lock = threading.Lock()
 _request_timestamps: Dict[str, float] = {}
-_MAX_REQUEST_AGE = 300  # 5 minutes
+_MAX_REQUEST_AGE = 300
 
-
-def generate_request_id() -> str:
-    """Generate a unique request ID for distributed tracing."""
+def
     return str(uuid.uuid4())[:16]
 
-
-def get_request_id(request) -> str:
-    """Extract request ID from request headers or generate new one."""
+def
     return request.headers.get("X-Request-ID", generate_request_id())
-
 
 def log_with_request_id(request_id: str, message: str, level: int = logging.INFO):
     """Log with request ID for tracing."""
     logger.log(level, f"[{request_id}] {message}")
 
-
-# =============================================================================
-# Seat Reservation System
-# =============================================================================
-
-_reservations: Dict[str, dict] = {}  # seat_id -> {user_id, expires_at, created_at}
+_reservations: Dict[str, dict] = {}
 _reservation_lock = threading.Lock()
-_RESERVATION_TTL = 900  # 15 minutes default
+_RESERVATION_TTL = 900
 _RESERVATION_MAX_PER_USER = 2
-
 
 def create_reservation(seat_id: str, user_id: str, ttl: int = None) -> dict:
     """Create a seat reservation."""
@@ -200,23 +147,21 @@ def create_reservation(seat_id: str, user_id: str, ttl: int = None) -> dict:
     now = time.time()
 
     with _reservation_lock:
-        # Check if seat already reserved
+
         if seat_id in _reservations:
             res = _reservations[seat_id]
             if res["expires_at"] > now:
                 if res["user_id"] == user_id:
-                    # Extend reservation
+
                     res["expires_at"] = now + ttl
                     return {"status": "extended", "seat_id": seat_id, "expires_at": res["expires_at"]}
                 return {"status": "error", "message": "Seat already reserved by another user"}
 
-        # Check user reservation limit
         user_reservations = [sid for sid, r in _reservations.items()
                            if r["user_id"] == user_id and r["expires_at"] > now]
         if len(user_reservations) >= _RESERVATION_MAX_PER_USER:
             return {"status": "error", "message": f"Maximum {_RESERVATION_MAX_PER_USER} reservations per user"}
 
-        # Create reservation
         _reservations[seat_id] = {
             "user_id": user_id,
             "expires_at": now + ttl,
@@ -224,7 +169,6 @@ def create_reservation(seat_id: str, user_id: str, ttl: int = None) -> dict:
         }
 
         return {"status": "created", "seat_id": seat_id, "expires_at": now + ttl}
-
 
 def release_reservation(seat_id: str, user_id: str) -> dict:
     """Release a seat reservation."""
@@ -239,7 +183,6 @@ def release_reservation(seat_id: str, user_id: str) -> dict:
         del _reservations[seat_id]
         return {"status": "released", "seat_id": seat_id}
 
-
 def get_reservation(seat_id: str) -> Optional[dict]:
     """Get reservation if exists and valid."""
     with _reservation_lock:
@@ -247,7 +190,6 @@ def get_reservation(seat_id: str) -> Optional[dict]:
         if res and res["expires_at"] > time.time():
             return res
         return None
-
 
 def get_user_reservations(user_id: str) -> List[dict]:
     """Get all active reservations for a user."""
@@ -259,9 +201,7 @@ def get_user_reservations(user_id: str) -> List[dict]:
             if r["user_id"] == user_id and r["expires_at"] > now
         ]
 
-
-def cleanup_expired_reservations():
-    """Remove expired reservations."""
+def
     now = time.time()
     with _reservation_lock:
         expired = [sid for sid, r in _reservations.items() if r["expires_at"] <= now]
@@ -269,48 +209,35 @@ def cleanup_expired_reservations():
             del _reservations[sid]
     return len(expired)
 
-
-# =============================================================================
-# Multi-Room Correlation
-# =============================================================================
-
-# Track patterns across rooms for cross-room ghost detection
-_room_patterns: Dict[str, dict] = {}  # room_id -> {last_pattern, seat_patterns}
+_room_patterns: Dict[str, dict] = {}
 _room_correlation_lock = threading.Lock()
 
-# Track current seat states from RPi (updated on each process_occupancy call)
-_current_seat_states: Dict[str, dict] = {}  # seat_id -> state data
+_current_seat_states: Dict[str, dict] = {}
 _seat_states_lock = threading.Lock()
-
 
 def update_room_pattern(room_id: str, seats_data: dict):
     """Update pattern tracking for cross-room correlation."""
     with _room_correlation_lock:
-        # Count seat states in this room (use ghost_state from RPi)
+
         state_counts = {"empty": 0, "occupied": 0, "suspected_ghost": 0, "confirmed_ghost": 0}
         for seat_info in seats_data.values():
             state = seat_info.get("ghost_state", seat_info.get("state", "empty"))
             if state in state_counts:
                 state_counts[state] += 1
 
-        # Store pattern
         _room_patterns[room_id] = {
             "timestamp": time.time(),
             "state_counts": state_counts,
             "seats_data": seats_data,
         }
 
-
 def detect_cross_room_ghosts(current_room_id: str, seat_id: str, current_state: str) -> Optional[dict]:
-    """
     Detect if a ghost pattern exists across multiple rooms.
     If same seat in multiple rooms shows ghost state, it's likely a false positive.
-    """
     with _room_correlation_lock:
         if len(_room_patterns) < 2:
             return None
 
-        # Find same seat ID in other rooms
         cross_room_matches = []
         for room_id, pattern in _room_patterns.items():
             if room_id == current_room_id:
@@ -325,7 +252,7 @@ def detect_cross_room_ghosts(current_room_id: str, seat_id: str, current_state: 
                         "age": time.time() - pattern["timestamp"],
                     })
 
-        if len(cross_room_matches) >= 2:  # Same pattern in 2+ rooms
+        if len(cross_room_matches) >= 2:
             return {
                 "type": "cross_room_correlation",
                 "seat_id": seat_id,
@@ -336,17 +263,10 @@ def detect_cross_room_ghosts(current_room_id: str, seat_id: str, current_state: 
 
         return None
 
-
-# =============================================================================
-# HTTP Connection Pooling
-# =============================================================================
-
 _http_session = None
 _http_pool_lock = threading.Lock()
 
-
-def get_http_session() -> requests.Session:
-    """Get or create HTTP session with connection pooling."""
+def
     global _http_session
     if _http_session is None:
         with _http_pool_lock:
@@ -361,26 +281,17 @@ def get_http_session() -> requests.Session:
                 _http_session.mount("https://", adapter)
     return _http_session
 
-
-# =============================================================================
-# Enhanced Error Recovery
-# =============================================================================
-
 _mqtt_reconnect_delay = 1.0
 _mqtt_max_reconnect_delay = 30.0
 
-
-def _should_reconnect_mqtt() -> bool:
-    """Check if MQTT should attempt reconnection."""
+def
     if mqtt_client is None:
         return True
     if not hasattr(mqtt_client, 'is_connected'):
         return True
     return not mqtt_client.is_connected()
 
-
-def _attempt_mqtt_reconnect():
-    """Attempt MQTT reconnection with exponential backoff."""
+def
     global _mqtt_reconnect_delay
 
     if not _should_reconnect_mqtt():
@@ -389,7 +300,7 @@ def _attempt_mqtt_reconnect():
     try:
         if mqtt_client:
             mqtt_client.reconnect()
-            _mqtt_reconnect_delay = 1.0  # Reset on success
+            _mqtt_reconnect_delay = 1.0
             return True
     except Exception as exc:
         logger.warning("MQTT reconnect failed: %s", exc)
@@ -397,27 +308,18 @@ def _attempt_mqtt_reconnect():
 
     return False
 
-
-# Schedule periodic MQTT reconnection attempts
-def _mqtt_reconnect_worker():
-    """Background worker for MQTT reconnection."""
+def
     while True:
         time.sleep(_mqtt_reconnect_delay)
         if _should_reconnect_mqtt():
             _attempt_mqtt_reconnect()
 
-
 _mqtt_reconnect_thread = None
-
 
 def _start_mqtt_reconnect_worker():
     global _mqtt_reconnect_thread
     _mqtt_reconnect_thread = threading.Thread(target=_mqtt_reconnect_worker, daemon=True)
     _mqtt_reconnect_thread.start()
-
-# =============================================================================
-# Initialization
-# =============================================================================
 
 def _init_mqtt() -> bool:
     global mqtt_client
@@ -428,19 +330,19 @@ def _init_mqtt() -> bool:
             global _mqtt_reconnect_delay
             if reason_code == 0 or str(reason_code) == "Success":
                 logger.info("MQTT connected to %s:%s", MQTT_BROKER_HOST, MQTT_BROKER_PORT)
-                # Subscribe to sensor topics AND occupancy topics
-                client.subscribe(MQTT_TOPIC_SENSOR)  # liberty_twin/sensor/#
-                client.subscribe("liberty_twin/sensor/+/occupancy")  # occupancy from RPis
-                client.subscribe("liberty_twin/state/#")  # state updates
+
+                client.subscribe(MQTT_TOPIC_SENSOR)
+                client.subscribe("liberty_twin/sensor/+/occupancy")
+                client.subscribe("liberty_twin/state/#")
                 logger.info("Subscribed to MQTT topics")
-                _mqtt_reconnect_delay = 1.0  # Reset backoff on successful connection
+                _mqtt_reconnect_delay = 1.0
             else:
                 logger.warning("MQTT connection refused: %s", reason_code)
 
         def on_disconnect(client, userdata, flags, reason_code, properties=None):
             global _mqtt_reconnect_delay
             logger.warning("MQTT disconnected (rc=%s). Will retry with backoff.", reason_code)
-            _mqtt_reconnect_delay = 1.0  # Reset on disconnect
+            _mqtt_reconnect_delay = 1.0
 
         def on_message(client, userdata, msg):
             _handle_mqtt_message(msg.topic, msg.payload)
@@ -455,7 +357,7 @@ def _init_mqtt() -> bool:
         client.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT, MQTT_KEEPALIVE)
         client.loop_start()
         mqtt_client = client
-        _start_mqtt_reconnect_worker()  # Start background reconnection worker
+        _start_mqtt_reconnect_worker()
         return True
     except ImportError:
         logger.warning("paho-mqtt not installed. MQTT disabled; using HTTP fallback only.")
@@ -464,7 +366,6 @@ def _init_mqtt() -> bool:
         logger.warning("Cannot connect to MQTT broker at %s:%s (%s). Using HTTP fallback.",
                         MQTT_BROKER_HOST, MQTT_BROKER_PORT, exc)
         return False
-
 
 def _init_influxdb() -> bool:
     global influx_client, influx_write_api
@@ -481,7 +382,6 @@ def _init_influxdb() -> bool:
         if health.status != "pass":
             logger.warning("InfluxDB health check did not pass: %s", health.message)
 
-        # Use batching writes instead of synchronous
         influx_write_api = influx_client.write_api(
             write_options=BATCHING,
             success_callback=_on_influx_write_success,
@@ -498,22 +398,14 @@ def _init_influxdb() -> bool:
                         INFLUXDB_URL, exc)
         return False
 
-
 def _on_influx_write_success(self, bucket: str, success: list):
     logger.debug("InfluxDB wrote %d points to %s", len(success), bucket)
-
 
 def _on_influx_write_error(self, bucket: str, failure: list):
     for point in failure:
         logger.warning("InfluxDB write failed for point: %s", point)
 
-
-# =============================================================================
-# Core Processing
-# =============================================================================
-
 def process_occupancy(data: dict, request_id: str = None):
-    """
     Process pre-computed seat occupancy from an RPi simulator.
 
     Expected data format:
@@ -527,7 +419,6 @@ def process_occupancy(data: dict, request_id: str = None):
             ...
         }
     }
-    """
     global _last_state_hash
 
     _stats["occupancy_count"] += 1
@@ -539,7 +430,6 @@ def process_occupancy(data: dict, request_id: str = None):
 
     rid = request_id or generate_request_id()
 
-    # Track RPi source
     if room_id not in _stats["rpi_sources"]:
         _stats["rpi_sources"].append(room_id)
 
@@ -557,31 +447,26 @@ def process_occupancy(data: dict, request_id: str = None):
         len(seats_data),
     )
 
-    # Update room pattern for cross-room correlation
     update_room_pattern(room_id, seats_data)
 
     state_updates: Dict[str, dict] = {}
 
     for seat_id, info in seats_data.items():
-        # Trust RPi's ghost_state computation (RPi runs full FSM with time tracking)
-        # Edge only does cross-room correlation and aggregation
+
         seat_state = info.get("ghost_state", "empty")
 
-        # Check for cross-room correlation using RPi's ghost_state
         if seat_state in ("suspected_ghost", "confirmed_ghost"):
             correlation = detect_cross_room_ghosts(room_id, seat_id, seat_state)
             if correlation:
                 logger.info("[%s] Cross-room correlation detected: %s", rid, correlation)
-                # Could adjust seat_state based on correlation here if needed
 
         zone_id = info.get("zone_id", SEAT_TO_ZONE.get(seat_id, ""))
 
-        # Forward RPi's computed values directly
         state_updates[seat_id] = {
             "seat_id": seat_id,
             "zone_id": zone_id,
             "state": seat_state,
-            "ghost_state": seat_state,  # Include for downstream compatibility
+            "ghost_state": seat_state,
             "occupancy_score": info.get("radar_presence", 0.0),
             "object_type": info.get("object_type", "empty"),
             "confidence": info.get("confidence", 0.0),
@@ -597,29 +482,22 @@ def process_occupancy(data: dict, request_id: str = None):
             "source_room": room_id,
         }
 
-    # Update global seat states for API queries
     with _seat_states_lock:
         for seat_id, state_data in state_updates.items():
             _current_seat_states[seat_id] = state_data
 
-    # Check for duplicates
     if _is_duplicate_state(state_updates):
         _stats["duplicates_skipped"] += 1
         logger.debug("[%s] Duplicate state update skipped", rid)
         return
 
-    # Publish state updates
     _publish_state_updates(state_updates, rid)
 
-    # Write to InfluxDB (alerts from RPi path handled separately by RPi itself)
     _write_to_influxdb(state_updates, [])
 
-
 def process_telemetry(data: dict):
-    """
     Process radar telemetry (legacy, from direct sensor connections).
     Note: Prefer receiving occupancy from RPi simulators.
-    """
     global _last_state_hash
 
     _stats["telemetry_count"] += 1
@@ -683,12 +561,10 @@ def process_telemetry(data: dict):
 
     _write_to_influxdb(state_updates, alerts)
 
-
 def _is_duplicate_state(state_updates: Dict[str, dict]) -> bool:
     """Check if state is duplicate using hash."""
     global _last_state_hash
 
-    # Create deterministic hash of state
     state_hash = _compute_state_hash(state_updates)
 
     with _state_hash_lock:
@@ -697,10 +573,9 @@ def _is_duplicate_state(state_updates: Dict[str, dict]) -> bool:
         _last_state_hash = state_hash
     return False
 
-
 def _compute_state_hash(state_updates: Dict[str, dict]) -> str:
     """Compute hash of seat states for deduplication."""
-    # Create deterministic representation
+
     state_repr = {}
     for seat_id in sorted(state_updates.keys()):
         s = state_updates[seat_id]
@@ -712,11 +587,6 @@ def _compute_state_hash(state_updates: Dict[str, dict]) -> str:
 
     json_str = json.dumps(state_repr, sort_keys=True)
     return hashlib.sha256(json_str.encode()).hexdigest()[:16]
-
-
-# =============================================================================
-# State Publishing
-# =============================================================================
 
 def _publish_state_updates(updates: Dict[str, dict], request_id: str = None):
     rid = request_id or ""
@@ -734,7 +604,6 @@ def _publish_state_updates(updates: Dict[str, dict], request_id: str = None):
         else:
             _http_fallback_seat(state_data)
 
-
 def _http_fallback_seat(state_data: dict):
     """Fallback: POST processed seat state to dashboard via HTTP when MQTT is down."""
     try:
@@ -748,11 +617,6 @@ def _http_fallback_seat(state_data: dict):
         logger.debug("HTTP fallback unavailable for %s: %s",
                      state_data.get("seat_id"), exc)
 
-
-# =============================================================================
-# Alert Batching
-# =============================================================================
-
 def _queue_alert(alert: GhostAlert):
     """Queue alert for batched publishing."""
     global _alert_batch, _last_alert_flush
@@ -761,7 +625,6 @@ def _queue_alert(alert: GhostAlert):
         _alert_batch.append(alert)
         _stats["alerts_batched"] += 1
 
-        # Flush if batch is full or timeout
         should_flush = (
             len(_alert_batch) >= _ALERT_BATCH_SIZE or
             (time.time() - _last_alert_flush) > _ALERT_BATCH_TIMEOUT
@@ -770,9 +633,7 @@ def _queue_alert(alert: GhostAlert):
         if should_flush:
             _flush_alerts()
 
-
-def _flush_alerts():
-    """Send batched alerts."""
+def
     global _alert_batch, _last_alert_flush
 
     with _alert_batch_lock:
@@ -785,7 +646,6 @@ def _flush_alerts():
 
     for alert in alerts_to_send:
         _publish_ghost_alert(alert)
-
 
 def _publish_ghost_alert(alert: GhostAlert):
     """Publish a single ghost alert."""
@@ -809,7 +669,6 @@ def _publish_ghost_alert(alert: GhostAlert):
     else:
         _http_fallback_alert(alert)
 
-
 def _http_fallback_alert(alert: GhostAlert):
     """Fallback: POST ghost alert to dashboard via HTTP when MQTT is down."""
     try:
@@ -831,11 +690,6 @@ def _http_fallback_alert(alert: GhostAlert):
     except Exception:
         pass
 
-
-# =============================================================================
-# InfluxDB Writing
-# =============================================================================
-
 def _write_to_influxdb(updates: Dict[str, dict], alerts: List[GhostAlert]):
     """Buffer and write to InfluxDB."""
     global _influx_batch, _last_influx_flush
@@ -849,7 +703,7 @@ def _write_to_influxdb(updates: Dict[str, dict], alerts: List[GhostAlert]):
         points = []
 
         for seat_id, state_data in updates.items():
-            # Use provided timestamp or current time
+
             ts = state_data.get("timestamp")
             if ts is None:
                 ts = time.time()
@@ -867,7 +721,7 @@ def _write_to_influxdb(updates: Dict[str, dict], alerts: List[GhostAlert]):
                 .field("radar_presence", float(state_data.get("radar_presence", 0)))
                 .field("radar_motion", float(state_data.get("radar_motion", 0)))
                 .field("object_type", str(state_data.get("object_type", "empty")))
-                .time(int(ts * 1_000_000_000))  # nanoseconds
+                .time(int(ts * 1_000_000_000))
             )
             points.append(p)
 
@@ -891,11 +745,6 @@ def _write_to_influxdb(updates: Dict[str, dict], alerts: List[GhostAlert]):
     except Exception as exc:
         logger.warning("InfluxDB write failed: %s", exc)
 
-
-# =============================================================================
-# MQTT Handling
-# =============================================================================
-
 def _handle_mqtt_message(topic: str, payload: bytes):
     try:
         data = json.loads(payload.decode("utf-8"))
@@ -910,11 +759,6 @@ def _handle_mqtt_message(topic: str, payload: bytes):
     else:
         logger.debug("Unhandled MQTT topic: %s", topic)
 
-
-# =============================================================================
-# HTTP Server
-# =============================================================================
-
 def _run_http_server():
     try:
         from flask import Flask, request, jsonify
@@ -926,14 +770,14 @@ def _run_http_server():
     app.logger.setLevel(logging.WARNING)
 
     @app.before_request
-    def before_request():
-        """Add request ID to all requests for tracing."""
+
+def
         request.request_id = get_request_id(request)
 
     @app.route("/api/occupancy", methods=["POST"])
-    def api_occupancy():
-        """Receive pre-computed seat occupancy from RPi simulators."""
-        # Rate limiting
+
+def
+
         client_id = request.headers.get("X-Forwarded-For", request.remote_addr)
         if not check_rate_limit(client_id):
             return jsonify({
@@ -954,7 +798,7 @@ def _run_http_server():
 
     @app.route("/api/telemetry", methods=["POST"])
     def api_telemetry():
-        # Rate limiting
+
         client_id = request.headers.get("X-Forwarded-For", request.remote_addr)
         if not check_rate_limit(client_id):
             return jsonify({
@@ -974,11 +818,8 @@ def _run_http_server():
         return jsonify({"ok": True, "request_id": request.request_id})
 
     @app.route("/api/camera", methods=["POST"])
-    def api_camera():
-        """
-        Legacy endpoint for direct camera frames.
-        Raw frames should NOT arrive here - they stay on RPi simulators.
-        """
+
+def
         data = request.get_json(silent=True)
         if not data:
             return jsonify({"error": "no JSON body"}), 400
@@ -998,12 +839,10 @@ def _run_http_server():
         if request.method == "POST":
             return jsonify({"ok": True, "request_id": request.request_id})
 
-        # Get current ghost states from RPi data
         with _seat_states_lock:
             states = {seat_id: data.get("ghost_state", data.get("state", "empty"))
                       for seat_id, data in _current_seat_states.items()}
 
-        # Count by state
         occupied = sum(1 for v in states.values() if v == "occupied")
         suspected = sum(1 for v in states.values() if v == "suspected_ghost")
         confirmed = sum(1 for v in states.values() if v == "confirmed_ghost")
@@ -1026,8 +865,8 @@ def _run_http_server():
         })
 
     @app.route("/api/state/<seat_id>", methods=["GET"])
-    def api_seat_state(seat_id):
-        """Get detailed state for a specific seat."""
+
+def
         with _seat_states_lock:
             seat_data = _current_seat_states.get(seat_id, {})
         reservation = get_reservation(seat_id)
@@ -1048,9 +887,9 @@ def _run_http_server():
         })
 
     @app.route("/api/seats", methods=["GET"])
-    def api_all_seats():
-        """Get state for all seats with optional filtering."""
-        state_filter = request.args.get("filter")  # empty, occupied, suspected, confirmed
+
+def
+        state_filter = request.args.get("filter")
         with _seat_states_lock:
             seat_states = {seat_id: data.get("ghost_state", data.get("state", "empty"))
                           for seat_id, data in _current_seat_states.items()}
@@ -1075,18 +914,14 @@ def _run_http_server():
             "request_id": request.request_id,
         })
 
-    # -------------------------------------------------------------------------
-    # Seat Reservation Endpoints
-    # -------------------------------------------------------------------------
-
     @app.route("/api/reservations", methods=["GET"])
-    def api_get_reservations():
-        """Get all active reservations (admin view)."""
+
+def
         user_id = request.args.get("user_id")
         if user_id:
             reservations = get_user_reservations(user_id)
         else:
-            # Return all reservations
+
             now = time.time()
             with _reservation_lock:
                 reservations = [
@@ -1101,8 +936,8 @@ def _run_http_server():
         })
 
     @app.route("/api/reservation/<seat_id>", methods=["POST"])
-    def api_create_reservation(seat_id):
-        """Create a seat reservation."""
+
+def
         data = request.get_json(silent=True) or {}
         user_id = data.get("user_id")
         if not user_id:
@@ -1113,8 +948,8 @@ def _run_http_server():
         return jsonify({**result, "request_id": request.request_id}), status
 
     @app.route("/api/reservation/<seat_id>", methods=["DELETE"])
-    def api_release_reservation(seat_id):
-        """Release a seat reservation."""
+
+def
         data = request.get_json(silent=True) or {}
         user_id = data.get("user_id")
         if not user_id:
@@ -1123,21 +958,17 @@ def _run_http_server():
         status = 200 if result["status"] == "released" else 400
         return jsonify({**result, "request_id": request.request_id}), status
 
-    # -------------------------------------------------------------------------
-    # Health & Readiness (Kubernetes-style)
-    # -------------------------------------------------------------------------
-
     @app.route("/health", methods=["GET"])
-    def health():
-        """Basic health check."""
+
+def
         return jsonify({
             "status": "ok",
             "uptime_seconds": round(time.time() - _start_time, 1),
         })
 
     @app.route("/health/ready", methods=["GET"])
-    def health_ready():
-        """Readiness probe - returns 200 if ready to serve traffic."""
+
+def
         checks = {
             "mqtt": mqtt_client is not None and mqtt_client.is_connected(),
             "influxdb": influx_write_api is not None,
@@ -1151,20 +982,16 @@ def _run_http_server():
         }), 200 if ready else 503
 
     @app.route("/health/live", methods=["GET"])
-    def health_live():
-        """Liveness probe - returns 200 if process is alive."""
+
+def
         return jsonify({
             "alive": True,
             "uptime_seconds": round(time.time() - _start_time, 1),
         })
 
-    # -------------------------------------------------------------------------
-    # Enhanced Metrics
-    # -------------------------------------------------------------------------
-
     @app.route("/metrics", methods=["GET"])
-    def metrics():
-        """Prometheus-style metrics endpoint with enhanced details."""
+
+def
         with _seat_states_lock:
             states = {seat_id: data.get("ghost_state", data.get("state", "empty"))
                      for seat_id, data in _current_seat_states.items()}
@@ -1172,7 +999,6 @@ def _run_http_server():
         suspected = sum(1 for v in states.values() if v == "suspected_ghost")
         confirmed = sum(1 for v in states.values() if v == "confirmed_ghost")
 
-        # Zone-based metrics
         zone_metrics = {}
         for zone_id, seats in ZONE_TO_SEATS.items():
             zone_states = {sid: states.get(sid, "empty") for sid in seats}
@@ -1183,7 +1009,6 @@ def _run_http_server():
                 "utilization": round(zone_occupied / len(seats) * 100, 1) if seats else 0,
             }
 
-        # Reservation stats
         now = time.time()
         with _reservation_lock:
             active_reservations = sum(1 for r in _reservations.values() if r["expires_at"] > now)
@@ -1263,13 +1088,9 @@ def _run_http_server():
         metrics_text = "\n".join(metrics_lines) + "\n"
         return metrics_text, 200, {"Content-Type": "text/plain"}
 
-    # -------------------------------------------------------------------------
-    # Cross-Room Analytics
-    # -------------------------------------------------------------------------
-
     @app.route("/api/analytics/rooms", methods=["GET"])
-    def api_room_analytics():
-        """Get analytics across all rooms."""
+
+def
         with _room_correlation_lock:
             room_data = {}
             for room_id, pattern in _room_patterns.items():
@@ -1286,8 +1107,8 @@ def _run_http_server():
         })
 
     @app.route("/api/analytics/utilization", methods=["GET"])
-    def api_utilization():
-        """Get zone utilization analytics."""
+
+def
         with _seat_states_lock:
             states = {seat_id: data.get("ghost_state", data.get("state", "empty"))
                      for seat_id, data in _current_seat_states.items()}
@@ -1321,24 +1142,17 @@ def _run_http_server():
     logger.info("Edge HTTP server starting on port %d", HTTP_FALLBACK_PORT)
     app.run(host="0.0.0.0", port=HTTP_FALLBACK_PORT, threaded=True, debug=False)
 
-
-# =============================================================================
-# Stats Logging
-# =============================================================================
-
 _start_time = time.time()
 
 def _log_stats_periodically(interval: float = 30.0):
     """Log statistics periodically."""
-    _flush_alerts()  # Flush any pending alerts
+    _flush_alerts()
 
     while True:
         time.sleep(interval)
 
-        # Flush pending batches
         _flush_alerts()
 
-        # Cleanup expired reservations
         expired_count = cleanup_expired_reservations()
 
         with _seat_states_lock:
@@ -1359,11 +1173,6 @@ def _log_stats_periodically(interval: float = 30.0):
             ", ".join(sorted(_stats["rpi_sources"])) or "none",
             expired_count,
         )
-
-
-# =============================================================================
-# Main
-# =============================================================================
 
 def main():
     global _start_time
@@ -1409,7 +1218,7 @@ def main():
 
     def _shutdown(signum, frame):
         logger.info("Shutting down edge processor...")
-        _flush_alerts()  # Flush pending alerts
+        _flush_alerts()
         if influx_write_api is not None:
             try:
                 influx_write_api.flush()
@@ -1428,7 +1237,6 @@ def main():
     signal.signal(signal.SIGTERM, _shutdown)
 
     _run_http_server()
-
 
 if __name__ == "__main__":
     main()

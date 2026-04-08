@@ -148,11 +148,6 @@ class GhostDetector:
                     "Seat %s: %s -> %s (%s)",
                     seat_id, prev_state.value, new_state.value, alert.alert_type,
                 )
-            else:
-                logger.debug(
-                    "Seat %s: %s -> %s (no alert)",
-                    seat_id, prev_state.value, new_state.value,
-                )
             return alert
 
         return None

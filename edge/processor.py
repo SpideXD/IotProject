@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+
 
 import base64
 import os
@@ -17,33 +17,28 @@ from functools import wraps
 
 import numpy as np
 import requests
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
-# Rate limiting configuration
-_RATE_LIMIT_WINDOW = 60.0  # 1 minute sliding window
-_RATE_LIMIT_MAX_REQUESTS = 1000  # per window
+_RATE_LIMIT_WINDOW = 60.0
+_RATE_LIMIT_MAX_REQUESTS = 1000
 
-# Seat reservation configuration
-_RESERVATION_TTL = 900  # 15 minutes default
+_RESERVATION_TTL = 900
 _RESERVATION_MAX_PER_USER = 2
 
-# In-memory rate limiting storage
 _rate_limit_storage: Dict[str, deque] = defaultdict(lambda: deque(maxlen=_RATE_LIMIT_MAX_REQUESTS))
 _rate_limit_lock = threading.Lock()
 
-# In-memory seat reservations: seat_id -> {user_id: expiry_time}
 _reservations: Dict[str, Dict[str, float]] = defaultdict(dict)
 _reservations_lock = threading.Lock()
 
-# Multi-room correlation: room_id -> pattern analysis
 _room_patterns: Dict[str, dict] = {}
 _room_correlation_lock = threading.Lock()
 
-# Multi-room occupancy storage: room_id -> {timestamp, seats}
 _occupancy_storage: Dict[str, dict] = {}
 _occupancy_lock = threading.Lock()
 
-# Request ID tracking for distributed tracing
-_request_ids: Dict[str, str] = {}  # trace_id -> request_id
+_request_ids: Dict[str, str] = {}
 
 from config import (
     MQTT_BROKER_HOST,
@@ -65,6 +60,8 @@ from config import (
     TOTAL_SEATS,
 )
 
+_start_time = time.time()
+
 HTTP_DASHBOARD_URL = os.environ.get("HTTP_DASHBOARD_URL", "http://localhost:5000/api/seat_state")
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format=LOG_FORMAT)
@@ -73,7 +70,6 @@ logger = logging.getLogger("processor")
 mqtt_client = None
 influx_write_api = None
 
-# Stats
 _stats = {
     "occupancy_received": 0,
     "mqtt_publishes": 0,
@@ -142,34 +138,22 @@ def _init_influxdb() -> bool:
         return False
 
 def _handle_mqtt_message(topic: str, payload: bytes):
-    """Handle incoming MQTT messages from RPi devices."""
     try:
         data = json.loads(payload.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         logger.warning("Invalid MQTT payload on %s: %s", topic, exc)
         return
 
-    # RPi sends pre-processed occupancy data
     if topic.endswith("/occupancy"):
         process_occupancy_from_rpi(data)
     elif topic.endswith("/telemetry"):
-        # Legacy telemetry format - convert to occupancy
         _process_legacy_telemetry(data)
     elif topic.endswith("/camera"):
-        # Legacy camera format - RPi should now send detections directly
         logger.debug("Legacy camera message received, ignoring (RPi should send occupancy)")
     else:
         logger.debug("Unhandled MQTT topic: %s", topic)
 
 def process_occupancy_from_rpi(data: dict):
-    """
-    Process pre-processed occupancy data from RPi.
-
-    RPi sends seat-level data with:
-    - is_present, occupancy_score (from sensor fusion)
-    - ghost_state (from ghost detection FSM)
-    - dwell_time, time_since_motion (from motion tracker)
-    """
     source = data.get("source", "unknown")
     room_id = data.get("room_id", "room_1")
     timestamp = data.get("timestamp", time.time())
@@ -183,26 +167,20 @@ def process_occupancy_from_rpi(data: dict):
         sum(1 for s in seats.values() if s.get("is_occupied")),
     )
 
-    # Store for multi-room aggregation
     with _occupancy_lock:
         _occupancy_storage[room_id] = {
             "timestamp": timestamp,
             "seats": seats,
         }
 
-    # Analyze room correlation
     seat_states = {seat_id: seat.get("ghost_state", "empty") for seat_id, seat in seats.items()}
     _analyze_room_correlation(room_id, seat_states)
 
-    # Forward to dashboard via MQTT
     _publish_occupancy_to_dashboard(room_id, seats, timestamp)
 
-    # Write to InfluxDB
     _write_occupancy_to_influxdb(room_id, seats, timestamp)
 
 def _process_legacy_telemetry(data: dict):
-    """Process legacy telemetry format (for backwards compatibility)."""
-    # Convert legacy format to occupancy format
     zone_id = data.get("zone_id", "")
     sensor_name = data.get("sensor", "unknown")
     seats_data = data.get("seats", {})
@@ -228,9 +206,7 @@ def _process_legacy_telemetry(data: dict):
     process_occupancy_from_rpi(occupancy_data)
 
 def _publish_occupancy_to_dashboard(room_id: str, seats: dict, timestamp: float):
-    """Forward occupancy data to dashboard via MQTT or HTTP."""
     for seat_id, seat_data in seats.items():
-        # Map is_occupied boolean to state string for dashboard compatibility
         is_occupied = seat_data.get("is_occupied", False)
         ghost_state = seat_data.get("ghost_state", "empty")
         if ghost_state in ("suspected_ghost", "confirmed_ghost"):
@@ -267,7 +243,6 @@ def _publish_occupancy_to_dashboard(room_id: str, seats: dict, timestamp: float)
             _http_fallback_seat(state_data)
 
 def _http_fallback_seat(state_data: dict):
-    """Fallback: POST processed seat state to dashboard via HTTP when MQTT is down."""
     try:
         resp = requests.post(HTTP_DASHBOARD_URL, json=state_data, timeout=2)
         if resp.status_code == 200:
@@ -278,7 +253,6 @@ def _http_fallback_seat(state_data: dict):
         logger.debug("HTTP fallback unavailable for %s: %s", state_data.get("seat_id"), exc)
 
 def _http_fallback_alert(alert: dict):
-    """Fallback: POST alert to dashboard via HTTP when MQTT is down."""
     try:
         payload = {
             "type": alert.get("alert_type", "unknown"),
@@ -298,11 +272,9 @@ def _http_fallback_alert(alert: dict):
         pass
 
 def _is_rate_limited(client_id: str = "default") -> bool:
-    """Check if client has exceeded rate limit. Returns True if rate limited."""
     now = time.time()
     with _rate_limit_lock:
         window = _rate_limit_storage[client_id]
-        # Remove expired entries
         while window and window[0] < now - _RATE_LIMIT_WINDOW:
             window.popleft()
         if len(window) >= _RATE_LIMIT_MAX_REQUESTS:
@@ -311,17 +283,14 @@ def _is_rate_limited(client_id: str = "default") -> bool:
         return False
 
 def _get_request_id() -> str:
-    """Generate a unique request ID for distributed tracing."""
     return str(uuid.uuid4())[:16]
 
 def _analyze_room_correlation(room_id: str, seat_states: Dict[str, str]) -> dict:
-    """Analyze seat patterns within a room for ghost detection correlation."""
     occupied = sum(1 for s in seat_states.values() if s == "occupied")
     suspected = sum(1 for s in seat_states.values() if s == "suspected_ghost")
     confirmed = sum(1 for s in seat_states.values() if s == "confirmed_ghost")
     empty = len(seat_states) - occupied - suspected - confirmed
 
-    # Ghost correlation: multiple suspected/confirmed in same zone suggests real object
     zone_ghosts: Dict[str, int] = defaultdict(int)
     for seat_id, state in seat_states.items():
         if state in ("suspected_ghost", "confirmed_ghost"):
@@ -348,9 +317,7 @@ def _analyze_room_correlation(room_id: str, seat_states: Dict[str, str]) -> dict
     return pattern
 
 def _create_reservation(seat_id: str, user_id: str) -> dict:
-    """Create a seat reservation for a user."""
     with _reservations_lock:
-        # Check user's existing reservations
         user_reservations = [
             sid for sid, users in _reservations.items()
             if user_id in users and users[user_id] > time.time()
@@ -358,22 +325,18 @@ def _create_reservation(seat_id: str, user_id: str) -> dict:
         if len(user_reservations) >= _RESERVATION_MAX_PER_USER:
             return {"success": False, "error": f"Maximum {_RESERVATION_MAX_PER_USER} reservations per user"}
 
-        # Check if seat is already reserved
         if seat_id in _reservations:
             active = {u: exp for u, exp in _reservations[seat_id].items() if exp > time.time()}
             if active:
-                # Check if user already has this reservation
                 if user_id in active:
                     return {"success": True, "seat_id": seat_id, "expires_at": active[user_id], "renewed": True}
                 return {"success": False, "error": "Seat already reserved"}
 
-        # Create new reservation
         expiry = time.time() + _RESERVATION_TTL
         _reservations[seat_id][user_id] = expiry
         return {"success": True, "seat_id": seat_id, "expires_at": expiry}
 
 def _release_reservation(seat_id: str, user_id: str) -> dict:
-    """Release a seat reservation."""
     with _reservations_lock:
         if seat_id in _reservations and user_id in _reservations[seat_id]:
             del _reservations[seat_id][user_id]
@@ -383,7 +346,6 @@ def _release_reservation(seat_id: str, user_id: str) -> dict:
         return {"success": False, "error": "Reservation not found"}
 
 def _get_all_reservations() -> dict:
-    """Get all active reservations."""
     now = time.time()
     result = {}
     with _reservations_lock:
@@ -399,7 +361,6 @@ def _get_all_reservations() -> dict:
     return result
 
 def _cleanup_expired_reservations():
-    """Remove expired reservations. Called periodically."""
     now = time.time()
     with _reservations_lock:
         for seat_id in list(_reservations.keys()):
@@ -409,7 +370,6 @@ def _cleanup_expired_reservations():
             if not _reservations[seat_id]:
                 del _reservations[seat_id]
 
-# Cleanup expired reservations every 5 minutes
 def _reservation_cleanup_thread():
     while True:
         time.sleep(300)
@@ -419,7 +379,6 @@ _cleanup_thread = threading.Thread(target=_reservation_cleanup_thread, daemon=Tr
 _cleanup_thread.start()
 
 def _write_occupancy_to_influxdb(room_id: str, seats: dict, timestamp: float):
-    """Write occupancy data to InfluxDB for time-series storage."""
     if influx_write_api is None:
         return
 
@@ -460,37 +419,14 @@ def _run_http_server():
 
     app = Flask("liberty_twin_edge")
     app.logger.setLevel(logging.WARNING)
+    CORS(app)
 
     @app.route("/api/occupancy", methods=["POST"])
     def api_occupancy():
-        """
-        Receive pre-processed occupancy data from RPi.
-
-        RPi sends:
-        {
-            "source": "rpi_simulator",
-            "room_id": "room_1",
-            "timestamp": 1234567890.123,
-            "seats": {
-                "S1": {
-                    "zone_id": "Z1",
-                    "is_occupied": true,
-                    "object_type": "person",
-                    "confidence": 0.9,
-                    "ghost_state": "occupied",
-                    "dwell_time": 120.5,
-                    "time_since_motion": 3.2,
-                    ...
-                },
-                ...
-            }
-        }
-        """
         data = request.get_json(silent=True)
         if not data:
             return jsonify({"error": "no JSON body"}), 400
 
-        # Rate limit by source
         client_id = data.get("room_id", "unknown")
         if _is_rate_limited(client_id):
             return jsonify({"error": "rate limited"}), 429
@@ -510,14 +446,16 @@ def _run_http_server():
         if request.method == "POST":
             return jsonify({"ok": True})
 
-        # Aggregate seat states from all rooms
         all_seats = {}
         with _occupancy_lock:
             for room_id, room_data in _occupancy_storage.items():
                 all_seats.update(room_data.get("seats", {}))
 
         return jsonify({
-            "stats": _stats,
+            "stats": {
+                **_stats,
+                "uptime_seconds": round(time.time() - _start_time, 1),
+            },
             "seat_states": {sid: seat.get("ghost_state", "empty") for sid, seat in all_seats.items()},
             "rooms_active": len(_occupancy_storage),
             "total_seats": TOTAL_SEATS,
@@ -533,10 +471,8 @@ def _run_http_server():
 
     @app.route("/health/ready", methods=["GET"])
     def health_ready():
-        """Kubernetes readiness probe - checks if the service can handle requests."""
         mqtt_ok = mqtt_client is not None and mqtt_client.is_connected()
         influx_ok = influx_write_api is not None
-        # Service is ready if at least one data pipeline works
         ready = mqtt_ok or influx_ok
         return jsonify({
             "ready": ready,
@@ -546,16 +482,88 @@ def _run_http_server():
 
     @app.route("/health/live", methods=["GET"])
     def health_live():
-        """Kubernetes liveness probe - checks if the service process is alive."""
         return jsonify({"alive": True})
+
+    @app.route("/api/live-frame", methods=["GET"])
+    def api_live_frame():
+        """
+        Proxy endpoint for RPi simulator live frame.
+        Forwards request to the RPi simulator (default localhost:5001).
+        Used by dashboard deep dive to display real-time camera feed.
+        """
+        import requests as req
+
+        rpi_url = os.environ.get("RPI_SIMULATOR_URL", "http://localhost:5001")
+        try:
+            resp = req.get(f"{rpi_url}/api/live-frame", timeout=1)
+            if resp.ok:
+                return resp.content, resp.status_code, {"Content-Type": "application/json"}
+            return jsonify({"error": "RPi simulator unavailable", "frame": None, "detections": []}), 200
+        except req.RequestException:
+            return jsonify({"error": "RPi simulator unreachable", "frame": None, "detections": []}), 200
+
+    @app.route("/metrics", methods=["GET"])
+    def metrics():
+        """
+        Prometheus-style metrics endpoint for dashboard deep dive.
+        """
+        with _occupancy_lock:
+            total_occupied = 0
+            total_empty = 0
+            total_suspected = 0
+            total_confirmed = 0
+
+            for room_data in _occupancy_storage.values():
+                for seat_data in room_data.get("seats", {}).values():
+                    state = seat_data.get("ghost_state", seat_data.get("state", "empty"))
+                    if state == "occupied":
+                        total_occupied += 1
+                    elif state == "suspected_ghost":
+                        total_suspected += 1
+                    elif state == "confirmed_ghost":
+                        total_confirmed += 1
+                    else:
+                        total_empty += 1
+
+        uptime = time.time() - _start_time
+
+        metrics_lines = [
+            "# HELP liberty_occupancy_count Total occupancy updates received",
+            "# TYPE liberty_occupancy_count counter",
+            f"liberty_occupancy_count {_stats.get('occupancy_received', 0)}",
+            "",
+            "# HELP liberty_mqtt_publishes Total MQTT messages published",
+            "# TYPE liberty_mqtt_publishes counter",
+            f"liberty_mqtt_publishes {_stats.get('mqtt_publishes', 0)}",
+            "",
+            "# HELP liberty_seats_occupied Current occupied seats",
+            "# TYPE liberty_seats_occupied gauge",
+            f"liberty_seats_occupied {total_occupied}",
+            "",
+            "# HELP liberty_seats_empty Current empty seats",
+            "# TYPE liberty_seats_empty gauge",
+            f"liberty_seats_empty {total_empty}",
+            "",
+            "# HELP liberty_seats_suspected_ghost Current suspected ghost seats",
+            "# TYPE liberty_seats_suspected_ghost gauge",
+            f"liberty_seats_suspected_ghost {total_suspected}",
+            "",
+            "# HELP liberty_seats_confirmed_ghost Current confirmed ghost seats",
+            "# TYPE liberty_seats_confirmed_ghost gauge",
+            f"liberty_seats_confirmed_ghost {total_confirmed}",
+            "",
+            "# HELP liberty_uptime_seconds Process uptime in seconds",
+            "# TYPE liberty_uptime_seconds gauge",
+            f"liberty_uptime_seconds {uptime}",
+        ]
+
+        return "\n".join(metrics_lines), 200, {"Content-Type": "text/plain"}
 
     @app.route("/api/seats", methods=["GET"])
     def api_seats():
-        """Get state for all seats with optional filtering."""
-        room = request.args.get("room", None)  # Optional room filter
-        state_filter = request.args.get("state", None)  # empty, occupied, suspected_ghost, confirmed_ghost
+        room = request.args.get("room", None)
+        state_filter = request.args.get("state", None)
 
-        # Collect seats from all rooms or selected room
         all_seats = {}
         with _occupancy_lock:
             if room:
@@ -587,7 +595,6 @@ def _run_http_server():
                 "last_update": seat_data.get("timestamp", 0),
             }
 
-            # Add reservation info
             with _reservations_lock:
                 if seat_id in _reservations:
                     active = {u: exp for u, exp in _reservations[seat_id].items() if exp > time.time()}
@@ -609,12 +616,10 @@ def _run_http_server():
 
     @app.route("/api/reservations", methods=["GET"])
     def api_reservations():
-        """Get all active reservations."""
         return jsonify(_get_all_reservations())
 
     @app.route("/api/reservation/<seat_id>", methods=["POST", "DELETE"])
     def api_reservation(seat_id: str):
-        """Create (POST) or release (DELETE) a reservation."""
         if request.method == "POST":
             data = request.get_json(silent=True) or {}
             user_id = data.get("user_id", "anonymous")
@@ -628,7 +633,6 @@ def _run_http_server():
 
     @app.route("/api/analytics/rooms", methods=["GET"])
     def api_analytics_rooms():
-        """Cross-room analytics for pattern correlation."""
         with _occupancy_lock:
             room_patterns = dict(_room_patterns)
 
@@ -640,7 +644,6 @@ def _run_http_server():
 
     @app.route("/api/analytics/utilization", methods=["GET"])
     def api_analytics_utilization():
-        """Zone utilization analytics across all rooms."""
         with _occupancy_lock:
             all_seats = {}
             for room_data in _occupancy_storage.values():
@@ -676,11 +679,6 @@ def _run_http_server():
 
     @app.route("/api/heatmap/<room_id>", methods=["GET"])
     def api_heatmap(room_id: str):
-        """
-        Generate heatmap data for a room (zones as heat cells).
-
-        Returns zone-level aggregated occupancy scores for visualization.
-        """
         _stats["heatmap_requests"] += 1
 
         with _occupancy_lock:
@@ -690,7 +688,6 @@ def _run_http_server():
             data = _occupancy_storage[room_id]
             seats = data.get("seats", {})
 
-        # Build zone-level heatmap
         zone_scores = {}
         for seat_id, seat_data in seats.items():
             zone_id = seat_data.get("zone_id", SEAT_TO_ZONE.get(seat_id, "unknown"))
@@ -726,7 +723,6 @@ def _run_http_server():
 
     @app.route("/api/rooms", methods=["GET"])
     def api_rooms():
-        """Get list of active rooms and their status."""
         with _occupancy_lock:
             rooms = []
             for room_id, room_data in _occupancy_storage.items():
