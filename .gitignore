@@ -36,3 +36,5 @@ Thumbs.db
 # Project specific large files
 issue.png
 *.zip
+
+node_modules/
