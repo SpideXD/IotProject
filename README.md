@@ -197,7 +197,7 @@ EMPTY ──[presence detected]──▶ OCCUPIED
 
 ## Demo & Links
 
-- **GitHub:** https://github.com/TheSpideX/liberty-twin
+- **GitHub:** https://github.com/SpideXD/IotProject
 - **Dataset:** https://www.kaggle.com/datasets/spidexd/iot-project-v2
 - **Model Training:** https://www.kaggle.com/code/spidexd/iot-model-training
-- **Demo Video:** https://drive.google.com/drive/folders/12_o5Q8x0iKpvJoQKwMnbd5_4B8_u7Mhl
+- **Demo Video:** https://drive.google.com/drive/folders/1QJ-Gg91P5NUIVUFy-l_mHb20-7Z3XkRm?usp=sharing
