@@ -447,16 +447,26 @@ def _run_http_server():
             return jsonify({"ok": True})
 
         all_seats = {}
+        state_counts = {"occupied": 0, "empty": 0, "suspected_ghost": 0, "confirmed_ghost": 0}
         with _occupancy_lock:
             for room_id, room_data in _occupancy_storage.items():
-                all_seats.update(room_data.get("seats", {}))
+                for seat_id, seat in room_data.get("seats", {}).items():
+                    all_seats[seat_id] = seat
+                    # RPi sends "state", other sources may send "ghost_state"
+                    ghost_state = seat.get("ghost_state", seat.get("state", "empty"))
+                    if ghost_state in state_counts:
+                        state_counts[ghost_state] += 1
+                    else:
+                        state_counts["empty"] += 1
 
         return jsonify({
             "stats": {
                 **_stats,
                 "uptime_seconds": round(time.time() - _start_time, 1),
+                "state_counts": state_counts,
+                "messages_per_minute": 0,
             },
-            "seat_states": {sid: seat.get("ghost_state", "empty") for sid, seat in all_seats.items()},
+            "seat_states": {sid: seat.get("ghost_state", seat.get("state", "empty")) for sid, seat in all_seats.items()},
             "rooms_active": len(_occupancy_storage),
             "total_seats": TOTAL_SEATS,
         })
